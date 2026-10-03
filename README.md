@@ -29,6 +29,9 @@
   - 只有两条规则 CIDR 交集内、且未被更早规则覆盖的地址可能变化；
   - 两规则动作相同（同为 allow 或同为 deny）时变化数恒为 0。
 - 查询结果列出**命中的首条规则**（id、index、action），未命中为默认 deny。
+- 只读插入规划（可选 `insertion` 字段，见下）：为一条待插入的临时规则
+  选择插入位置，满足探针结论与保护地址约束，同时尽量少改变其他地址的
+  现行决策；规划不修改策略本身。
 
 ## 输入格式
 
@@ -44,6 +47,47 @@
 ```
 
 `queries` 可省略。示例见 [`examples/policy.json`](examples/policy.json)。
+
+## 只读插入规划（`insertion`）
+
+在请求里加入可选的 `insertion` 字段即可为一条临时规则规划插入位置
+（完整示例见 [`examples/insertion.json`](examples/insertion.json)）：
+
+```json
+{
+  "rules": [
+    { "id": "web", "action": "allow", "cidr": "10.0.0.0/24" },
+    { "id": "deny-all", "action": "deny", "cidr": "0.0.0.0/0" }
+  ],
+  "insertion": {
+    "rule": { "id": "temp-debug", "action": "allow", "cidr": "192.168.0.0/24" },
+    "probes": [{ "address": "192.168.0.10", "expect": "allow" }],
+    "protected": ["10.0.0.5"]
+  }
+}
+```
+
+- `rule`（必填）：待插入的新规则，契约与 `rules` 条目完全相同，且 `id`
+  不得与现有规则重复。
+- `probes`（可选，至多 100 条）：插入后**必须**得到指定 `expect`
+  （`allow`/`deny`）结论的地址。
+- `protected`（可选，至多 100 个）：插入后**必须维持原结论**的地址。
+
+规划器遍历全部 `0..n` 个插入位置（`0` = 插到最前，`n` = 追加到末尾），
+只保留同时满足所有探针与保护地址的位置，在其中选择**完整 IPv4 地址空间
+内决策翻转地址数最小**的方案，并列时取最靠前的位置。报告的 `insertion`
+字段包含：
+
+- `position`：选定位置（新规则在插入后列表中的下标）；
+- `changedAddresses` / `changedIntervals`：决策翻转的地址总数，以及按
+  地址排序、互不重叠的闭区间列表（`startAddress`/`endAddress`）；
+- `probes`：每个探针的新旧首匹配证据（`before`/`after` 的
+  `ruleId`/`index`/`action`，`after` 的下标已按插入后的列表计算）；
+- `protected`：每个保护地址的新旧首匹配证据与 `preserved` 确认。
+
+任何位置都无法同时满足全部约束时返回 `{ "feasible": false, "reason": ... }`，
+不输出可应用的方案。`insertion` 存在与否不影响原有 `rules`/`swaps`/
+`queries`/`summary` 各节；非法输入整次拒绝（CLI 退出码 1，HTTP 400）。
 
 ## CLI
 
@@ -85,6 +129,10 @@ curl -s -X POST http://localhost:3000/audit \
   - `shadowed` 证书按地址从左到右生成：在每个最小未覆盖地址，选择与目标
     CIDR 相交且覆盖该地址、右端最远的先前规则；右端并列选更早序号。该区间
     贪心给出最少规则数，每步只记录相对已选规则新覆盖的闭区间。
+  - 插入位置 `p` 的决策变化集 = `(新规则区间 − 前 p 条规则并集) ∩ 原决策
+    ≠ 新规则动作的地址集`。原决策集复用首匹配暴露区间按动作求并（deny 集
+    = 全集 − allow 集，天然包含默认 deny 区域），因此命中规则变化但动作
+    不变的地址不计入，且全程只做区间运算、从不枚举地址。
   交集对两个 IPv4 CIDR 而言要么为空，要么是一个整区间，所以无需区间拆分。
 - 地址总数与见证都在区间上直接求和/取最小值，最大仅 2³²，双精度整数可精确表示。
 
@@ -98,6 +146,10 @@ npm test          # vitest run
 - `test/validation.test.ts` — 数量上限、重复 id、未知字段、越界八位组等；
 - `test/semantics.test.ts` — 手算断言：`/0`（2³² 计数）、完全遮蔽、分片残留、
   相邻交换（含同动作无影响）、查询首匹配、默认 deny 与覆盖证书；
+- `test/insertion.test.ts` — 插入规划：在 `10.13.0.0/24` 小地址域内逐地址
+  预言机对拍最优位置、变化区间与新旧首匹配证据（200 个随机策略），手算
+  断言 `/0` 新规则、重叠 CIDR、默认 deny 探针、保护地址冲突与并列取最前，
+  以及 CLI 运行时与 HTTP `POST /audit` 对同一输入的一致性；
 - `test/bruteforce.test.ts` — **对拍测试**：在 `10.13.0.0/24` 小子网内逐地址
   穷举（256 个地址全部线性扫描），与审计器输出逐条规则、逐对相邻交换、逐查询
   比较；含 300 个固定随机种子策略；对带 `/0` 的策略，用规则端点划分的最大恒定

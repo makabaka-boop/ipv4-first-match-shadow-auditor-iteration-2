@@ -17,12 +17,14 @@ import {
   parseCidr,
   parseIp,
   type Cidr,
+  type IP,
 } from "./ip.js";
 import {
   addRange,
   countAddresses,
   minimumAddress,
   subtract,
+  union,
   EMPTY,
   type IntervalSet,
 } from "./intervals.js";
@@ -95,6 +97,56 @@ export interface QueryResult {
   index: number | null;
 }
 
+/** First-match evidence for one address under a given rule list. */
+export interface FirstMatchEvidence {
+  /** Matching rule id, or null when the default action decides. */
+  ruleId: string | null;
+  /** Index of the matching rule in the evaluated list, or null for the default. */
+  index: number | null;
+  action: Action; // "deny" when ruleId is null
+}
+
+/** One closed interval of addresses whose decision flips after insertion. */
+export interface ChangedInterval {
+  startAddress: string;
+  endAddress: string;
+}
+
+export interface InsertionProbeReport {
+  address: string;
+  expect: Action;
+  /** First match under the original rule list. */
+  before: FirstMatchEvidence;
+  /** First match with the new rule inserted at the selected position. */
+  after: FirstMatchEvidence;
+  /** Whether the post-insertion decision equals the expected one. */
+  satisfied: boolean;
+}
+
+export interface InsertionProtectedReport {
+  address: string;
+  before: FirstMatchEvidence;
+  after: FirstMatchEvidence;
+  /** Whether the insertion kept this address's original decision. */
+  preserved: boolean;
+}
+
+/** The selected insertion plan; computed with interval algebra only. */
+export interface InsertionPlan {
+  /** Index the new rule would occupy (0 = before all, ruleCount = after all). */
+  position: number;
+  /** Addresses in the whole IPv4 space whose allow/deny decision flips. */
+  changedAddresses: number;
+  /** Sorted, non-overlapping closed intervals covering exactly those addresses. */
+  changedIntervals: ChangedInterval[];
+  probes: InsertionProbeReport[];
+  protected: InsertionProtectedReport[];
+}
+
+export type InsertionReport =
+  | ({ rule: RuleInput; feasible: true } & InsertionPlan)
+  | { rule: RuleInput; feasible: false; reason: string };
+
 export interface AuditReport {
   rules: RuleAudit[];
   swaps: SwapAudit[];
@@ -105,6 +157,8 @@ export interface AuditReport {
     shadowedCount: number;
     defaultAction: Action;
   };
+  /** Read-only insertion plan; present only when the request carries one. */
+  insertion?: InsertionReport;
 }
 
 /** Validation failure carrying a JSON-pointer-ish path for the CLI/server. */
@@ -117,10 +171,14 @@ export class ValidationError extends Error {
   }
 }
 
-const ROOT_FIELDS = new Set(["rules", "queries"]);
+const ROOT_FIELDS = new Set(["rules", "queries", "insertion"]);
 const RULE_FIELDS = new Set(["id", "action", "cidr"]);
+const INSERTION_FIELDS = new Set(["rule", "probes", "protected"]);
+const PROBE_FIELDS = new Set(["address", "expect"]);
 const MAX_RULES = 300;
 const MAX_QUERIES = 100;
+const MAX_PROBES = 100;
+const MAX_PROTECTED = 100;
 
 const knownObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -142,6 +200,37 @@ interface ParsedRule {
   cidr: Cidr;
 }
 
+/** Validate one rule object (shared by the rules array and insertion.rule). */
+function parseRuleObject(raw: unknown, path: string): ParsedRule {
+  if (!knownObject(raw)) {
+    throw new ValidationError("rule must be an object", path);
+  }
+  rejectUnknownFields(raw, RULE_FIELDS, path);
+
+  const { id, action, cidr } = raw;
+  if (typeof id !== "string" || id.length === 0) {
+    throw new ValidationError("id must be a non-empty string", `${path}.id`);
+  }
+  if (action !== "allow" && action !== "deny") {
+    throw new ValidationError(
+      'action must be "allow" or "deny"',
+      `${path}.action`,
+    );
+  }
+  if (typeof cidr !== "string") {
+    throw new ValidationError("cidr must be a string", `${path}.cidr`);
+  }
+
+  let parsedCidr: Cidr;
+  try {
+    parsedCidr = parseCidr(cidr);
+  } catch (err) {
+    throw new ValidationError((err as Error).message, `${path}.cidr`);
+  }
+
+  return { input: { id, action, cidr }, cidr: parsedCidr };
+}
+
 function parseRules(value: unknown): ParsedRule[] {
   if (!Array.isArray(value)) {
     throw new ValidationError("rules must be an array", "$.rules");
@@ -160,37 +249,15 @@ function parseRules(value: unknown): ParsedRule[] {
   const seenIds = new Set<string>();
   value.forEach((raw, i) => {
     const path = `$.rules[${i}]`;
-    if (!knownObject(raw)) {
-      throw new ValidationError("rule must be an object", path);
-    }
-    rejectUnknownFields(raw, RULE_FIELDS, path);
-
-    const { id, action, cidr } = raw;
-    if (typeof id !== "string" || id.length === 0) {
-      throw new ValidationError("id must be a non-empty string", `${path}.id`);
-    }
-    if (seenIds.has(id)) {
-      throw new ValidationError(`duplicate rule id "${id}"`, `${path}.id`);
-    }
-    if (action !== "allow" && action !== "deny") {
+    const rule = parseRuleObject(raw, path);
+    if (seenIds.has(rule.input.id)) {
       throw new ValidationError(
-        'action must be "allow" or "deny"',
-        `${path}.action`,
+        `duplicate rule id "${rule.input.id}"`,
+        `${path}.id`,
       );
     }
-    if (typeof cidr !== "string") {
-      throw new ValidationError("cidr must be a string", `${path}.cidr`);
-    }
-
-    let parsedCidr: Cidr;
-    try {
-      parsedCidr = parseCidr(cidr);
-    } catch (err) {
-      throw new ValidationError((err as Error).message, `${path}.cidr`);
-    }
-
-    seenIds.add(id);
-    rules.push({ input: { id, action, cidr }, cidr: parsedCidr });
+    seenIds.add(rule.input.id);
+    rules.push(rule);
   });
   return rules;
 }
@@ -216,11 +283,109 @@ function parseQueries(value: unknown): number[] {
   });
 }
 
+interface ParsedProbe {
+  address: string;
+  expect: Action;
+  ip: IP;
+}
+
+interface ParsedProtected {
+  address: string;
+  ip: IP;
+}
+
+interface ParsedInsertion {
+  rule: ParsedRule;
+  probes: ParsedProbe[];
+  protectedAddresses: ParsedProtected[];
+}
+
+function parseProbes(value: unknown): ParsedProbe[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new ValidationError("probes must be an array", "$.insertion.probes");
+  }
+  if (value.length > MAX_PROBES) {
+    throw new ValidationError(
+      `too many probes: ${value.length} > ${MAX_PROBES}`,
+      "$.insertion.probes",
+    );
+  }
+  return value.map((raw, i) => {
+    const path = `$.insertion.probes[${i}]`;
+    if (!knownObject(raw)) {
+      throw new ValidationError("probe must be an object", path);
+    }
+    rejectUnknownFields(raw, PROBE_FIELDS, path);
+    const { address, expect } = raw;
+    let ip: IP;
+    try {
+      ip = parseIp(address);
+    } catch (err) {
+      throw new ValidationError((err as Error).message, `${path}.address`);
+    }
+    if (expect !== "allow" && expect !== "deny") {
+      throw new ValidationError(
+        'expect must be "allow" or "deny"',
+        `${path}.expect`,
+      );
+    }
+    return { address: address as string, expect, ip };
+  });
+}
+
+function parseProtected(value: unknown): ParsedProtected[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new ValidationError(
+      "protected must be an array",
+      "$.insertion.protected",
+    );
+  }
+  if (value.length > MAX_PROTECTED) {
+    throw new ValidationError(
+      `too many protected addresses: ${value.length} > ${MAX_PROTECTED}`,
+      "$.insertion.protected",
+    );
+  }
+  return value.map((raw, i) => {
+    const path = `$.insertion.protected[${i}]`;
+    try {
+      return { address: raw as string, ip: parseIp(raw) };
+    } catch (err) {
+      throw new ValidationError((err as Error).message, path);
+    }
+  });
+}
+
+function parseInsertion(value: unknown, existingIds: Set<string>): ParsedInsertion {
+  if (!knownObject(value)) {
+    throw new ValidationError("insertion must be an object", "$.insertion");
+  }
+  rejectUnknownFields(value, INSERTION_FIELDS, "$.insertion");
+  if (!("rule" in value)) {
+    throw new ValidationError("missing required field rule", "$.insertion.rule");
+  }
+  const rule = parseRuleObject(value.rule, "$.insertion.rule");
+  if (existingIds.has(rule.input.id)) {
+    throw new ValidationError(
+      `duplicate rule id "${rule.input.id}"`,
+      "$.insertion.rule.id",
+    );
+  }
+  return {
+    rule,
+    probes: parseProbes(value.probes),
+    protectedAddresses: parseProtected(value.protected),
+  };
+}
+
 /** Parse and validate the raw JSON request body. */
 export function parseRequest(raw: unknown): {
   rules: ParsedRule[];
   queries: number[];
   rawQueries: unknown[];
+  insertion: ParsedInsertion | null;
 } {
   if (!knownObject(raw)) {
     throw new ValidationError("request body must be a JSON object");
@@ -231,10 +396,18 @@ export function parseRequest(raw: unknown): {
   }
   const rules = parseRules(raw.rules);
   const queryIps = parseQueries(raw.queries);
+  const insertion =
+    raw.insertion === undefined
+      ? null
+      : parseInsertion(
+          raw.insertion,
+          new Set(rules.map((r) => r.input.id)),
+        );
   return {
     rules,
     queries: queryIps,
     rawQueries: raw.queries === undefined ? [] : (raw.queries as unknown[]),
+    insertion,
   };
 }
 
@@ -246,6 +419,17 @@ const statusFor = (
   if (countAddresses(exposed) === totalAddresses) return "active";
   return "partial";
 };
+
+/** First matching rule for an address, or the default deny when none matches. */
+function firstMatch(rules: ParsedRule[], ip: IP): FirstMatchEvidence {
+  for (let i = 0; i < rules.length; i++) {
+    const { cidr, input } = rules[i]!;
+    if (ip >= cidr.lo && ip <= cidr.hi) {
+      return { ruleId: input.id, index: i, action: input.action };
+    }
+  }
+  return { ruleId: null, index: null, action: "deny" };
+}
 
 /**
  * Build a minimum-size certificate that a target CIDR is covered by earlier
@@ -297,9 +481,157 @@ function coverageCertificate(
   return { ruleIds, steps };
 }
 
+/**
+ * Plan where to insert one new rule without touching the audited policy.
+ *
+ * Inserting at position p keeps rules 0..p-1 ahead of the new rule, so the
+ * only addresses whose decision can flip are those the new rule covers and no
+ * earlier rule decides: residual(p) = newRange − covered(0..p-1). On residual
+ * the new rule decides everything with its own action, hence
+ *
+ *   changed(p) = residual(p) ∩ { addresses whose original decision ≠ newAction }
+ *
+ * The original-decision sets come from the same first-match exposed intervals
+ * as the audit (the deny set is the complement of the allow set, which also
+ * captures the default-deny region), so no address is ever enumerated and a
+ * first-match change that keeps the same action is not counted.
+ *
+ * A position is feasible when every probe reaches its expected decision and
+ * every protected address keeps its original one. Among feasible positions
+ * the plan minimizes |changed(p)|; ties keep the earliest position.
+ */
+function planInsertion(
+  rules: ParsedRule[],
+  insertion: ParsedInsertion,
+): InsertionReport {
+  const n = rules.length;
+  const newRule = insertion.rule;
+  const newRange = cidrRange(newRule.cidr);
+  const newAction = newRule.input.action;
+
+  // coveredPrefix[p] = addresses decided by original rules 0..p-1.
+  const coveredPrefix: IntervalSet[] = [EMPTY];
+  for (let i = 0; i < n; i++) {
+    coveredPrefix.push(addRange(coveredPrefix[i]!, cidrRange(rules[i]!.cidr)));
+  }
+
+  // Addresses whose original decision is "allow": the union of what each
+  // allow rule actually decides. Everything else is deny (rules or default).
+  let allowSet: IntervalSet = EMPTY;
+  for (let i = 0; i < n; i++) {
+    if (rules[i]!.input.action === "allow") {
+      const exposed = subtract([cidrRange(rules[i]!.cidr)], coveredPrefix[i]!);
+      allowSet = union(allowSet, exposed);
+    }
+  }
+  // Addresses that already have the new rule's action never flip.
+  const keepSet = newAction === "allow"
+    ? allowSet
+    : subtract([{ lo: 0, hi: 0xffffffff }], allowSet);
+
+  // First-match facts for every constrained address, computed once.
+  interface AddressFacts {
+    before: FirstMatchEvidence;
+    /** Index of the first matching original rule; n when the default decides. */
+    firstIndex: number;
+    coveredByNew: boolean;
+  }
+  const factsFor = (ip: IP): AddressFacts => {
+    const before = firstMatch(rules, ip);
+    return {
+      before,
+      firstIndex: before.index ?? n,
+      coveredByNew: ip >= newRange.lo && ip <= newRange.hi,
+    };
+  };
+  const probeFacts = insertion.probes.map((probe) => ({
+    ...probe,
+    ...factsFor(probe.ip),
+  }));
+  const protectedFacts = insertion.protectedAddresses.map((entry) => ({
+    ...entry,
+    ...factsFor(entry.ip),
+  }));
+
+  // Decision for an address after inserting at p: the new rule decides iff it
+  // covers the address and no original rule before p does.
+  const decisionAfter = (f: AddressFacts, p: number): Action =>
+    f.coveredByNew && f.firstIndex >= p ? newAction : f.before.action;
+
+  const evidenceAfter = (f: AddressFacts, p: number): FirstMatchEvidence => {
+    if (f.coveredByNew && f.firstIndex >= p) {
+      return { ruleId: newRule.input.id, index: p, action: newAction };
+    }
+    // Rules at or after the insertion point shift one index down.
+    return f.firstIndex < n && f.firstIndex >= p
+      ? { ...f.before, index: f.firstIndex + 1 }
+      : f.before;
+  };
+
+  let best: {
+    position: number;
+    changedAddresses: number;
+    changed: IntervalSet;
+  } | null = null;
+
+  for (let p = 0; p <= n; p++) {
+    const feasible =
+      probeFacts.every((f) => decisionAfter(f, p) === f.expect) &&
+      protectedFacts.every((f) => decisionAfter(f, p) === f.before.action);
+    if (!feasible) continue;
+
+    const residual = subtract([newRange], coveredPrefix[p]!);
+    const changed = subtract(residual, keepSet);
+    const changedAddresses = countAddresses(changed);
+    if (best === null || changedAddresses < best.changedAddresses) {
+      best = { position: p, changedAddresses, changed };
+    }
+  }
+
+  if (best === null) {
+    return {
+      rule: newRule.input,
+      feasible: false,
+      reason:
+        "no insertion position satisfies every probe expectation and every protected address",
+    };
+  }
+
+  const p = best.position;
+  return {
+    rule: newRule.input,
+    feasible: true,
+    position: p,
+    changedAddresses: best.changedAddresses,
+    changedIntervals: best.changed.map((r) => ({
+      startAddress: formatIp(r.lo),
+      endAddress: formatIp(r.hi),
+    })),
+    probes: probeFacts.map((f) => {
+      const after = evidenceAfter(f, p);
+      return {
+        address: f.address,
+        expect: f.expect,
+        before: f.before,
+        after,
+        satisfied: after.action === f.expect,
+      };
+    }),
+    protected: protectedFacts.map((f) => {
+      const after = evidenceAfter(f, p);
+      return {
+        address: f.address,
+        before: f.before,
+        after,
+        preserved: after.action === f.before.action,
+      };
+    }),
+  };
+}
+
 /** Run the full audit over parsed input. */
 export function audit(raw: unknown): AuditReport {
-  const { rules, queries, rawQueries } = parseRequest(raw);
+  const { rules, queries, rawQueries, insertion } = parseRequest(raw);
 
   // Per-rule residual analysis. `covered` = addresses decided by rules 0..i-1.
   const coveredBefore: IntervalSet[] = [];
@@ -360,25 +692,10 @@ export function audit(raw: unknown): AuditReport {
   }
 
   // Query resolution: first matching rule wins, otherwise default deny.
-  const queryReports: QueryResult[] = queries.map((ip, i) => {
-    for (let r = 0; r < rules.length; r++) {
-      const { cidr, input } = rules[r]!;
-      if (ip >= cidr.lo && ip <= cidr.hi) {
-        return {
-          query: String(rawQueries[i]),
-          ruleId: input.id,
-          action: input.action,
-          index: r,
-        };
-      }
-    }
-    return {
-      query: String(rawQueries[i]),
-      action: "deny" as Action,
-      ruleId: null,
-      index: null,
-    };
-  });
+  const queryReports: QueryResult[] = queries.map((ip, i) => ({
+    query: String(rawQueries[i]),
+    ...firstMatch(rules, ip),
+  }));
 
   return {
     rules: ruleReports,
@@ -390,5 +707,6 @@ export function audit(raw: unknown): AuditReport {
       shadowedCount: ruleReports.filter((r) => r.status === "shadowed").length,
       defaultAction: "deny",
     },
+    ...(insertion === null ? {} : { insertion: planInsertion(rules, insertion) }),
   };
 }

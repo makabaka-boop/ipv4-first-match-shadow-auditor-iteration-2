@@ -1,0 +1,16 @@
+{
+  "rules": [
+    { "id": "web", "action": "allow", "cidr": "10.0.0.0/24" },
+    { "id": "api", "action": "allow", "cidr": "10.0.0.128/25" },
+    { "id": "deny-all", "action": "deny", "cidr": "0.0.0.0/0" }
+  ],
+  "queries": ["10.0.0.5", "192.168.0.10"],
+  "insertion": {
+    "rule": { "id": "temp-debug", "action": "allow", "cidr": "192.168.0.0/24" },
+    "probes": [
+      { "address": "192.168.0.10", "expect": "allow" },
+      { "address": "8.8.8.8", "expect": "deny" }
+    ],
+    "protected": ["10.0.0.5", "10.0.0.200"]
+  }
+}

@@ -1,0 +1,18 @@
+services:
+  policy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fw-audit-policy:latest
+    container_name: fw-audit-policy
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped

@@ -1,0 +1,24 @@
+{
+  "name": "fw-audit",
+  "version": "1.0.0",
+  "description": "First-match firewall rule auditor: coverage, shadowing, swap impact and query resolution over IPv4 CIDRs",
+  "type": "module",
+  "bin": {
+    "fw-audit": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}

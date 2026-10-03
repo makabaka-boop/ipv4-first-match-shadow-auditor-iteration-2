@@ -52,6 +52,25 @@ export function union(a: IntervalSet, b: IntervalSet): IntervalSet {
   return merged;
 }
 
+/** Intersection `a ∩ b` of two sorted disjoint interval sets. */
+export function intersection(a: IntervalSet, b: IntervalSet): IntervalSet {
+  if (a.length === 0 || b.length === 0) return EMPTY;
+  const out: AddrRange[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < a.length && j < b.length) {
+    const ai = a[i]!;
+    const bj = b[j]!;
+    const lo = Math.max(ai.lo, bj.lo);
+    const hi = Math.min(ai.hi, bj.hi);
+    if (lo <= hi) out.push({ lo, hi });
+    if (ai.hi < bj.hi) i++;
+    else j++;
+  }
+  return out;
+}
+
 /**
  * Set difference `a - b` for two sorted disjoint interval sets.
  * Returns a fresh sorted disjoint interval set.
